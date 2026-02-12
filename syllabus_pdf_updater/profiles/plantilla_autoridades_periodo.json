@@ -1,0 +1,26 @@
+{
+  "app": "Syllabus PDF Updater Pro",
+  "description": "Plantilla base para cambios frecuentes en autoridades y periodo.",
+  "replacements": [
+    {
+      "find": "Dr. Robert Enríquez Reyes",
+      "replace": "Dr. Nombre Docente Nuevo"
+    },
+    {
+      "find": "Ing. Miryam Paredes PhD",
+      "replace": "Ing. Nombre Coordinador Nuevo PhD"
+    },
+    {
+      "find": "Ing. Mauro Rosas",
+      "replace": "Ing. Nombre Director Nuevo"
+    },
+    {
+      "find": "2025-2026",
+      "replace": "2026-2027"
+    },
+    {
+      "find": "2025-09",
+      "replace": "2026-09"
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "replacements": [
+    {
+      "find": "Rector Antiguo",
+      "replace": "Rector Nuevo"
+    },
+    {
+      "find": "Decano Antiguo",
+      "replace": "Decano Nuevo"
+    },
+    {
+      "find": "Tema Antiguo",
+      "replace": "Tema Actualizado"
+    }
+  ]
+}

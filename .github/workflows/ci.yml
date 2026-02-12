@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r syllabus_pdf_updater/requirements.txt
+      - name: Compile check
+        run: |
+          python -m py_compile \
+            syllabus_pdf_updater/app.py \
+            syllabus_pdf_updater/document_analyzer.py \
+            syllabus_pdf_updater/pdf_tools.py \
+            syllabus_pdf_updater/tools/generate_profile.py
