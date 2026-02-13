@@ -1,5 +1,5 @@
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QFormLayout, QLineEdit, 
+    QWidget, QVBoxLayout, QFormLayout, QLineEdit, QTextEdit,
     QGroupBox, QScrollArea, QLabel, QPushButton, QHBoxLayout
 )
 from PySide6.QtCore import Signal
@@ -29,7 +29,7 @@ class FormPanel(QWidget):
         self.actions_layout.addWidget(self.btn_apply_suggestions)
         self.layout.addLayout(self.actions_layout)
 
-        self.inputs: Dict[str, QLineEdit] = {}
+        self.inputs: Dict[str, QWidget] = {} # QLineEdit or QTextEdit
         self.fields_ref: List[EditableField] = []
 
     def load_fields(self, fields: List[EditableField]):
@@ -54,11 +54,22 @@ class FormPanel(QWidget):
             form_layout = QFormLayout()
             
             for field in group_fields:
-                edit = QLineEdit(field.current_value)
-                edit.textChanged.connect(lambda val, f=field: self.on_text_change(f, val))
+                # Usar TextEdit (multilínea) para bibliografía y resultados
+                is_multiline = field.category in [FieldCategory.BIBLIOGRAFIA, FieldCategory.RESULTADO]
+                
+                if is_multiline:
+                    edit = QTextEdit()
+                    edit.setPlainText(field.current_value)
+                    edit.setMinimumHeight(60)
+                    edit.setMaximumHeight(100)
+                    edit.textChanged.connect(lambda f=field: self.on_text_change(f, self.inputs[f.id].toPlainText()))
+                else:
+                    edit = QLineEdit(field.current_value)
+                    edit.textChanged.connect(lambda val, f=field: self.on_text_change(f, val))
                 
                 if field.suggested_value:
-                    edit.setPlaceholderText(f"Sugerido: {field.suggested_value}")
+                    if isinstance(edit, QLineEdit):
+                        edit.setPlaceholderText(f"Sugerido: {field.suggested_value}")
                     # Tooltip informativo
                     edit.setToolTip(f"Original: {field.original_value}\nSugerido: {field.suggested_value}")
                 
@@ -78,4 +89,8 @@ class FormPanel(QWidget):
         for field in self.fields_ref:
             if field.suggested_value and field.current_value == field.original_value:
                 if field.id in self.inputs:
-                    self.inputs[field.id].setText(field.suggested_value)
+                    widget = self.inputs[field.id]
+                    if isinstance(widget, QLineEdit):
+                        widget.setText(field.suggested_value)
+                    elif isinstance(widget, QTextEdit):
+                        widget.setPlainText(field.suggested_value)

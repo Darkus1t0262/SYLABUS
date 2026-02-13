@@ -1,6 +1,13 @@
 import sys
+import os
+from pathlib import Path
+
+# Add project root to sys.path
+current_dir = Path(__file__).parent
+sys.path.append(str(current_dir.parent))
+
 from PySide6.QtWidgets import QApplication
-from .ui.main_window import MainWindow
+from syllabus_pro.ui.main_window import MainWindow
 
 def main():
     app = QApplication(sys.argv)

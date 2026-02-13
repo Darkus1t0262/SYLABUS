@@ -10,6 +10,9 @@ class FieldCategory(str, Enum):
     TEMA = "Temas"
     UNIDAD = "Unidades"
     FECHA = "Fechas Globales"
+    RESULTADO = "Resultados Aprendizaje"
+    BIBLIOGRAFIA = "Bibliografía"
+    HORAS = "Horas"
     OTRO = "Otro"
 
 class EditableField(BaseModel):
