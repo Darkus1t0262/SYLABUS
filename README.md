@@ -61,23 +61,4 @@ syllabus_pdf_updater/
 - Lee `CONTRIBUTING.md` para flujo de ramas y PR.
 - Usa perfiles JSON en `syllabus_pdf_updater/profiles/` para compartir cambios.
 
-## Publicar en GitHub (repo publico)
 
-Si usas GitHub CLI (`gh`) y ya estas autenticado:
-
-```powershell
-git init -b main
-git add .
-git commit -m "Initial public release: Syllabus PDF Updater Pro"
-gh repo create syllabus-pdf-updater-pro --public --source . --remote origin --push
-```
-
-Si no usas `gh`:
-1. Crea el repo publico en GitHub web.
-2. Conecta remoto y sube:
-
-```powershell
-git remote add origin https://github.com/TU_USUARIO/syllabus-pdf-updater-pro.git
-git branch -M main
-git push -u origin main
-```
