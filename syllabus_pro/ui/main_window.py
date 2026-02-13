@@ -84,9 +84,11 @@ class MainWindow(QMainWindow):
             self.viewer.clear()
             for i in range(self.current_analysis.page_count):
                 img_bytes = self.pdf_service.get_page_image(i)
-                self.viewer.add_page(img_bytes, i)
+                page_size = self.pdf_service.get_page_size(i)
+                self.viewer.add_page(img_bytes, i, page_size)
             
             self.form_panel.load_fields(self.current_analysis.fields)
+            self.viewer.update_overlays(self.current_analysis.fields)
             
             # Actualizar estado
             msg = f"Cargado: {self.current_analysis.page_count} páginas. "
@@ -116,9 +118,16 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"Error al guardar:\n{str(e)}")
 
     def on_field_changed(self, field_id: str, new_val: str):
-        # Aquí podríamos actualizar el overlay del visor en tiempo real
-        if self.current_analysis:
-            self.viewer.update_overlays(self.current_analysis.fields)
+        if not self.current_analysis:
+            return
+
+        for field in self.current_analysis.fields:
+            if field.id == field_id:
+                field.current_value = new_val
+                break
+
+        self.viewer.update_overlays(self.current_analysis.fields)
+        self.status.showMessage(f"Campo actualizado: {field_id}")
 
     def closeEvent(self, event):
         self.pdf_service.close()

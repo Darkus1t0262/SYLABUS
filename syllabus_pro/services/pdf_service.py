@@ -1,10 +1,11 @@
 import fitz  # type: ignore
 import pdfplumber
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple, Any
+from typing import List, Optional, Tuple, Any
 import re
 import os
 import shutil
+from statistics import median
 from ..core.models import AnalysisResult, EditableField, FieldCategory
 
 class PDFService:
@@ -38,6 +39,13 @@ class PDFService:
         pix = page.get_pixmap(matrix=mat)
         return pix.tobytes("png")
 
+    def get_page_size(self, page_num: int) -> Tuple[float, float]:
+        if not self._doc or page_num < 0 or page_num >= len(self._doc):
+            return (1.0, 1.0)
+        page = self._doc[page_num]
+        rect = page.rect
+        return (float(rect.width), float(rect.height))
+
     def save_pdf(self, output_path: Path, fields: List[EditableField]) -> None:
         if not self._doc:
             raise RuntimeError("No hay documento cargado para guardar.")
@@ -58,31 +66,79 @@ class PDFService:
                 for field in page_fields:
                     if not field.is_modified:
                         continue
+                    target_rect, source_rects = self._resolve_target_rect(page, field)
+                    if not target_rect:
+                        continue
 
-                    if field.rect:
-                        rect = fitz.Rect(field.rect)
-                        page.add_redact_annot(rect, fill=(1, 1, 1))
-                        page.apply_redactions()
-                        page.insert_textbox(
-                            rect, 
+                    style = self._extract_text_style(page, target_rect)
+                    measure_font = self._measurement_font_name(style["source_font"])
+                    insert_font, insert_font_file = self._resolve_insert_font(page, style["source_font"])
+                    base_size = self._fit_font_size(
+                        field.original_value,
+                        target_rect,
+                        measure_font,
+                        style["fontsize"]
+                    )
+                    max_font_size = min(style["fontsize"], base_size)
+                    font_size = self._fit_font_size(
+                        field.current_value,
+                        target_rect,
+                        measure_font,
+                        max_font_size
+                    )
+                    align = self._choose_alignment()
+
+                    line_rects = self._extract_text_line_rects(page, target_rect)
+                    if line_rects:
+                        slot_size, slot_lines = self._fit_text_to_line_slots(
                             field.current_value,
-                            fontsize=9, 
-                            fontname="helv",
-                            color=(0, 0, 0)
+                            line_rects,
+                            measure_font,
+                            max_font_size
                         )
-                    else:
-                        hits = page.search_for(field.original_value)
-                        if hits:
-                            for rect in hits:
-                                page.add_redact_annot(rect, fill=(1, 1, 1))
-                            page.apply_redactions()
-                            page.insert_textbox(
-                                hits[0], 
-                                field.current_value, 
-                                fontsize=10, 
-                                fontname="helv",
-                                color=(0, 0, 0)
-                            )
+                        if slot_size and slot_lines is not None:
+                            self._clear_rects_with_redaction(page, line_rects, preserve_borders=False)
+                            for idx, line_text in enumerate(slot_lines):
+                                line_text = line_text.strip()
+                                if not line_text:
+                                    continue
+                                line_rect = line_rects[idx]
+                                text_x = line_rect.x0 + 0.25
+                                # Baseline estable para evitar fallos de textbox en líneas muy ajustadas.
+                                text_y = line_rect.y1 - max(0.4, slot_size * 0.12)
+                                page.insert_text(
+                                    fitz.Point(text_x, text_y),
+                                    line_text,
+                                    fontsize=max(6.0, slot_size - 0.1),
+                                    fontname=insert_font,
+                                    fontfile=insert_font_file,
+                                    color=style["color"],
+                                    render_mode=0,
+                                    overlay=True
+                                )
+                            continue
+
+                    is_cell_rect = bool(field.rect and len(field.rect) == 4)
+                    self._clear_rects_with_redaction(page, source_rects, preserve_borders=is_cell_rect)
+
+                    write_rect = fitz.Rect(
+                        target_rect.x0 + 1.2,
+                        target_rect.y0 + 0.8,
+                        target_rect.x1 - 1.2,
+                        target_rect.y1 - 0.8
+                    )
+                    if write_rect.width <= 2 or write_rect.height <= 2:
+                        write_rect = target_rect
+
+                    page.insert_textbox(
+                        write_rect,
+                        field.current_value,
+                        fontsize=font_size,
+                        fontname=insert_font,
+                        fontfile=insert_font_file,
+                        color=style["color"],
+                        align=align
+                    )
 
             # 1. Guardar siempre a un archivo NUEVO temporal primero
             # Esto evita cualquier conflicto de bloqueo con el archivo de destino
@@ -156,6 +212,9 @@ class PDFService:
         # Detectar firma digital (simple)
         is_signed = self._detect_signature()
 
+        self._ensure_unique_field_ids(fields)
+        self._infer_missing_rects(fields)
+
         return AnalysisResult(
             file_path=self._path,
             page_count=len(self._doc),
@@ -163,6 +222,503 @@ class PDFService:
             fields=fields,
             warnings=[]
         )
+
+    def _ensure_unique_field_ids(self, fields: List[EditableField]) -> None:
+        seen: dict[str, int] = {}
+        for field in fields:
+            base = field.id
+            count = seen.get(base, 0) + 1
+            seen[base] = count
+            if count > 1:
+                field.id = f"{base}__{count}"
+
+    def _infer_missing_rects(self, fields: List[EditableField]) -> None:
+        if not self._doc:
+            return
+
+        for field in fields:
+            if field.rect:
+                continue
+            if field.page_number < 0 or field.page_number >= len(self._doc):
+                continue
+            original = (field.original_value or "").strip()
+            if not original:
+                continue
+
+            try:
+                page = self._doc[field.page_number]
+                hits = self._search_hits(page, original)
+                selected_hits = self._select_hits_for_text(hits, original)
+                if selected_hits:
+                    union_rect = self._union_rects(selected_hits)
+                    field.rect = [union_rect.x0, union_rect.y0, union_rect.x1, union_rect.y1]
+            except Exception:
+                # Si no se puede inferir coordenada, mantenemos fallback por texto al guardar.
+                continue
+
+    def _resolve_target_rect(
+        self, page: fitz.Page, field: EditableField
+    ) -> Tuple[Optional[fitz.Rect], List[fitz.Rect]]:
+        if field.rect and len(field.rect) == 4:
+            rect = fitz.Rect(field.rect)
+            return rect, [rect]
+
+        hits = self._search_hits(page, field.original_value)
+        selected_hits = self._select_hits_for_text(hits, field.original_value)
+        if not selected_hits:
+            return None, []
+
+        return self._union_rects(selected_hits), selected_hits
+
+    def _build_clear_rect(self, rect: fitz.Rect, preserve_borders: bool) -> fitz.Rect:
+        if preserve_borders:
+            # Mantener líneas de tabla: limpiar interior de celda sin tocar bordes.
+            # Usar margen mínimo para cubrir texto previo y preservar la línea del cuadro.
+            inset_x = min(0.35, max(0.12, rect.width * 0.003))
+            inset_y = min(0.30, max(0.10, rect.height * 0.003))
+            x0 = rect.x0 + inset_x
+            y0 = rect.y0 + inset_y
+            x1 = rect.x1 - inset_x
+            y1 = rect.y1 - inset_y
+        else:
+            # Para hits de texto sueltos, ampliar ligeramente para cubrir tinta completa.
+            x0 = rect.x0 - 0.4
+            y0 = rect.y0 - 0.3
+            x1 = rect.x1 + 0.4
+            y1 = rect.y1 + 0.3
+
+        if x1 <= x0 or y1 <= y0:
+            return rect
+        return fitz.Rect(x0, y0, x1, y1)
+
+    def _clear_rects_with_redaction(
+        self, page: fitz.Page, rects: List[fitz.Rect], preserve_borders: bool
+    ) -> None:
+        if not rects:
+            return
+        for rect in rects:
+            clear_rect = self._build_clear_rect(rect, preserve_borders=preserve_borders)
+            page.add_redact_annot(clear_rect, fill=(1, 1, 1))
+        page.apply_redactions(
+            images=fitz.PDF_REDACT_IMAGE_NONE,
+            graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+            text=fitz.PDF_REDACT_TEXT_REMOVE
+        )
+
+    def _extract_text_line_rects(self, page: fitz.Page, rect: fitz.Rect) -> List[fitz.Rect]:
+        try:
+            data = page.get_text("dict", clip=rect)
+        except Exception:
+            return []
+
+        raw_lines: List[fitz.Rect] = []
+        for block in data.get("blocks", []):
+            for line in block.get("lines", []):
+                spans = line.get("spans", [])
+                if not spans:
+                    continue
+                has_text = any((span.get("text") or "").strip() for span in spans)
+                if not has_text:
+                    continue
+                bbox = line.get("bbox")
+                if not bbox:
+                    continue
+                line_rect = fitz.Rect(bbox)
+                if line_rect.width <= 1 or line_rect.height <= 1:
+                    continue
+                raw_lines.append(line_rect)
+
+        if not raw_lines:
+            return []
+
+        raw_lines.sort(key=lambda r: (r.y0, r.x0))
+        merged_rows: List[List[fitz.Rect]] = []
+        for line_rect in raw_lines:
+            y_mid = (line_rect.y0 + line_rect.y1) / 2
+            placed = False
+            for row in merged_rows:
+                ref = row[0]
+                ref_mid = (ref.y0 + ref.y1) / 2
+                if abs(y_mid - ref_mid) <= 1.4:
+                    row.append(line_rect)
+                    placed = True
+                    break
+            if not placed:
+                merged_rows.append([line_rect])
+
+        line_rects: List[fitz.Rect] = []
+        for row in merged_rows:
+            x0 = min(r.x0 for r in row)
+            y0 = min(r.y0 for r in row)
+            x1 = max(r.x1 for r in row)
+            y1 = max(r.y1 for r in row)
+            merged = fitz.Rect(x0, y0, x1, y1)
+            # Usar el ancho de la celda para evitar que el wrap dependa de segmentos de texto parciales.
+            merged = fitz.Rect(rect.x0 + 0.4, merged.y0, rect.x1 - 0.4, merged.y1)
+            line_rects.append(merged)
+
+        line_rects.sort(key=lambda r: (r.y0, r.x0))
+        return line_rects
+
+    def _search_hits(self, page: fitz.Page, text: str) -> List[fitz.Rect]:
+        safe_text = (text or "").strip()
+        if not safe_text:
+            return []
+        try:
+            hits = page.search_for(safe_text)
+        except Exception:
+            return []
+        return sorted(hits, key=lambda r: (r.y0, r.x0))
+
+    def _select_hits_for_text(self, hits: List[fitz.Rect], text: str) -> List[fitz.Rect]:
+        if not hits:
+            return []
+        if len(hits) == 1:
+            return hits
+
+        # Para textos largos tomamos el bloque contiguo más cercano al primer hit.
+        if len((text or "").strip()) < 30:
+            return [hits[0]]
+
+        selected = [hits[0]]
+        for rect in hits[1:]:
+            prev = selected[-1]
+            same_block = (rect.y0 - prev.y1) <= 18 and abs(rect.x0 - selected[0].x0) <= 180
+            if not same_block:
+                break
+            selected.append(rect)
+        return selected
+
+    def _union_rects(self, rects: List[fitz.Rect]) -> fitz.Rect:
+        x0 = min(r.x0 for r in rects)
+        y0 = min(r.y0 for r in rects)
+        x1 = max(r.x1 for r in rects)
+        y1 = max(r.y1 for r in rects)
+        return fitz.Rect(x0, y0, x1, y1)
+
+    def _extract_text_style(self, page: fitz.Page, rect: fitz.Rect) -> dict:
+        style = {
+            "fontsize": 9.5,
+            "color": (0.0, 0.0, 0.0),
+            "source_font": "",
+        }
+        try:
+            data = page.get_text("dict", clip=rect)
+        except Exception:
+            return style
+
+        spans = []
+        for block in data.get("blocks", []):
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    txt = (span.get("text") or "").strip()
+                    if txt:
+                        spans.append(span)
+
+        if not spans:
+            return style
+
+        # Usar mediana para evitar outliers (ej. títulos o spans sueltos grandes).
+        span_sizes = [
+            float(s.get("size") or style["fontsize"])
+            for s in spans
+            if float(s.get("size") or 0) > 0
+        ]
+        if span_sizes:
+            raw_size = median(span_sizes)
+            style["fontsize"] = max(6.0, min(11.0, float(raw_size)))
+
+        main_span = max(spans, key=lambda s: len((s.get("text") or "").strip()))
+        style["source_font"] = str(main_span.get("font") or "")
+
+        color = main_span.get("color")
+        if isinstance(color, int):
+            style["color"] = self._int_to_rgb(color)
+
+        return style
+
+    def _measurement_font_name(self, source_font: str) -> str:
+        name = (source_font or "").lower()
+        if "times" in name:
+            return "times-roman"
+        if "courier" in name:
+            return "cour"
+        # Calibri y Arial miden parecido con Helvetica para ajuste aproximado.
+        return "helv"
+
+    def _resolve_insert_font(self, page: fitz.Page, source_font: str) -> Tuple[str, Optional[str]]:
+        family = self._normalized_font_family(source_font)
+        if not family:
+            family = self._preferred_family_from_page(page)
+        if not family:
+            return "helv", None
+
+        font_file = self._find_system_font_file(source_font, family)
+        if not font_file:
+            return "helv", None
+
+        alias = f"APPFONT_{family.upper()}"
+        return alias, font_file
+
+    def _preferred_family_from_page(self, page: fitz.Page) -> str:
+        try:
+            fonts = page.get_fonts(full=True)
+        except Exception:
+            return ""
+
+        found_calibri = False
+        found_arial = False
+        for font_info in fonts:
+            base_name = str(font_info[3] or "").lower()
+            if "calibri" in base_name:
+                found_calibri = True
+            if "arial" in base_name:
+                found_arial = True
+
+        if found_calibri:
+            return "calibri"
+        if found_arial:
+            return "arial"
+        return ""
+
+    def _normalized_font_family(self, source_font: str) -> str:
+        name = (source_font or "").lower()
+        if "calibri" in name:
+            return "calibri"
+        if "arial" in name:
+            return "arial"
+        if "times" in name:
+            return "times"
+        if "courier" in name:
+            return "courier"
+        return ""
+
+    def _find_system_font_file(self, source_font: str, family: str) -> Optional[str]:
+        windir = os.environ.get("WINDIR", "C:\\Windows")
+        fonts_dir = Path(windir) / "Fonts"
+        if not fonts_dir.exists():
+            return None
+
+        src = (source_font or "").lower()
+        is_bold = "bold" in src
+        is_italic = "italic" in src or "oblique" in src
+
+        if family == "calibri":
+            candidates = []
+            if is_bold and is_italic:
+                candidates.append("calibriz.ttf")
+            if is_bold:
+                candidates.append("calibrib.ttf")
+            if is_italic:
+                candidates.append("calibrii.ttf")
+            candidates.append("calibri.ttf")
+        elif family == "arial":
+            candidates = []
+            if is_bold and is_italic:
+                candidates.append("arialbi.ttf")
+            if is_bold:
+                candidates.append("arialbd.ttf")
+            if is_italic:
+                candidates.append("ariali.ttf")
+            candidates.append("arial.ttf")
+        elif family == "times":
+            candidates = ["times.ttf", "timesbd.ttf"]
+        elif family == "courier":
+            candidates = ["cour.ttf", "courbd.ttf"]
+        else:
+            candidates = []
+
+        for filename in candidates:
+            path = fonts_dir / filename
+            if path.exists():
+                return str(path)
+        return None
+
+    def _int_to_rgb(self, color_int: int) -> Tuple[float, float, float]:
+        r = (color_int >> 16) & 255
+        g = (color_int >> 8) & 255
+        b = color_int & 255
+        return (r / 255.0, g / 255.0, b / 255.0)
+
+    def _choose_alignment(self) -> int:
+        # La justificación automática distorsiona la estética cuando cambia la longitud.
+        # Mantener alineación a la izquierda produce resultados más estables.
+        return getattr(fitz, "TEXT_ALIGN_LEFT", 0)
+
+    def _fit_text_to_line_slots(
+        self,
+        text: str,
+        line_rects: List[fitz.Rect],
+        fontname: str,
+        preferred_size: float
+    ) -> Tuple[Optional[float], Optional[List[str]]]:
+        if not line_rects:
+            return None, None
+
+        widths = [max(8.0, r.width - 0.6) for r in line_rects]
+        size = max(6.0, min(13.0, preferred_size))
+        while size >= 6.0:
+            wrapped = self._wrap_text_to_widths(
+                text=text,
+                widths=widths,
+                fontname=fontname,
+                fontsize=size,
+            )
+            if wrapped is not None:
+                return round(size, 1), wrapped
+            size -= 0.25
+        return None, None
+
+    def _wrap_text_to_widths(
+        self,
+        text: str,
+        widths: List[float],
+        fontname: str,
+        fontsize: float,
+    ) -> Optional[List[str]]:
+        max_lines = len(widths)
+        if max_lines == 0:
+            return None
+
+        paragraphs = (text or "").replace("\r", "").split("\n")
+        lines: List[str] = []
+
+        for paragraph in paragraphs:
+            words = paragraph.split()
+            if not words:
+                if len(lines) >= max_lines:
+                    return None
+                lines.append("")
+            else:
+                current = ""
+                idx = 0
+                while idx < len(words):
+                    if len(lines) >= max_lines:
+                        return None
+
+                    word = words[idx]
+                    width_limit = widths[len(lines)]
+                    candidate = word if not current else f"{current} {word}"
+                    if self._text_width(candidate, fontname, fontsize) <= width_limit:
+                        current = candidate
+                        idx += 1
+                        continue
+
+                    if current:
+                        lines.append(current)
+                        current = ""
+                        continue
+
+                    parts = self._split_word(word, width_limit, fontname, fontsize)
+                    if not parts:
+                        return None
+                    lines.append(parts[0])
+                    if len(parts) > 1:
+                        words[idx] = "".join(parts[1:])
+                    else:
+                        idx += 1
+
+                if current:
+                    if len(lines) >= max_lines:
+                        return None
+                    lines.append(current)
+
+        if len(lines) > max_lines:
+            return None
+        return lines
+
+    def _text_width(self, text: str, fontname: str, fontsize: float) -> float:
+        try:
+            return fitz.get_text_length(text, fontname=fontname, fontsize=fontsize)
+        except Exception:
+            return fitz.get_text_length(text, fontname="helv", fontsize=fontsize)
+
+    def _fit_font_size(
+        self,
+        text: str,
+        rect: fitz.Rect,
+        fontname: str,
+        preferred_size: float
+    ) -> float:
+        start_size = max(6.0, min(13.0, preferred_size))
+        size = start_size
+        while size >= 6.0:
+            if self._text_fits_rect(text, rect, fontname, size):
+                return round(size, 1)
+            size -= 0.5
+        return 6.0
+
+    def _text_fits_rect(
+        self,
+        text: str,
+        rect: fitz.Rect,
+        fontname: str,
+        fontsize: float
+    ) -> bool:
+        max_width = max(8.0, rect.width - 4.0)
+        max_height = max(8.0, rect.height - 2.0)
+        line_height = fontsize * 1.2
+        line_count = 0
+
+        paragraphs = (text or "").splitlines()
+        if not paragraphs:
+            paragraphs = [text or ""]
+
+        for paragraph in paragraphs:
+            words = paragraph.split()
+            if not words:
+                line_count += 1
+                continue
+
+            line = ""
+            for word in words:
+                candidate = f"{line} {word}".strip()
+                if fitz.get_text_length(candidate, fontname=fontname, fontsize=fontsize) <= max_width:
+                    line = candidate
+                    continue
+
+                if line:
+                    line_count += 1
+                    line = word
+                else:
+                    parts = self._split_word(word, max_width, fontname, fontsize)
+                    line_count += max(0, len(parts) - 1)
+                    line = parts[-1] if parts else ""
+
+                if fitz.get_text_length(line, fontname=fontname, fontsize=fontsize) > max_width:
+                    parts = self._split_word(line, max_width, fontname, fontsize)
+                    line_count += max(0, len(parts) - 1)
+                    line = parts[-1] if parts else ""
+
+            if line or not words:
+                line_count += 1
+
+        required_height = line_count * line_height
+        return required_height <= max_height
+
+    def _split_word(
+        self,
+        word: str,
+        max_width: float,
+        fontname: str,
+        fontsize: float
+    ) -> List[str]:
+        if not word:
+            return [""]
+
+        pieces: List[str] = []
+        current = ""
+        for ch in word:
+            candidate = f"{current}{ch}"
+            if fitz.get_text_length(candidate, fontname=fontname, fontsize=fontsize) <= max_width:
+                current = candidate
+            else:
+                if current:
+                    pieces.append(current)
+                current = ch
+        if current:
+            pieces.append(current)
+        return pieces or [word]
 
     def _detect_signature(self) -> bool:
         if not self._path: return False
@@ -231,7 +787,7 @@ class PDFService:
 
         # Iterar tablas para encontrar la correcta
         tables = page.find_tables()
-        for table in tables:
+        for table_idx, table in enumerate(tables):
             # Verificar si la tabla tiene cabecera compatible
             rows = table.extract()
             if not rows: continue
@@ -260,9 +816,9 @@ class PDFService:
                              # pdfplumber rect: (x0, top, x1, bottom)
                              # fitz rect: (x0, top, x1, bottom) - Son compatibles en sistema coords estándar PDF (salvo origen Y a veces)
                              # pdfplumber usa origen top-left. Fitz usa top-left. Compatible.
-                             
+                            
                              fields.append(EditableField(
-                                id=f"result_learn_{page_num}_{i}_{j}",
+                                id=f"result_learn_{page_num}_{table_idx}_{i}_{j}",
                                 category=FieldCategory.RESULTADO,
                                 label=f"Resultado {i}-{j}",
                                 original_value=cell.strip(),
