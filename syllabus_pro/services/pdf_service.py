@@ -40,85 +40,90 @@ class PDFService:
 
     def save_pdf(self, output_path: Path, fields: List[EditableField]) -> None:
         if not self._doc:
-            return
+            raise RuntimeError("No hay documento cargado para guardar.")
 
-        # Trabajar sobre una copia en memoria para no dañar el documento actual si falla
-        # O simplemente aplicar cambios. Como fitz modifica en memoria, 
-        # si queremos seguir editando, debemos tener cuidado.
-        # Para simplificar: aplicamos cambios al doc actual.
+        # Crear nombre de archivo temporal único
+        import time
+        temp_filename = f"{output_path.stem}_tmp_{int(time.time())}.pdf"
+        temp_path = output_path.parent / temp_filename
         
-        for page_num, page in enumerate(self._doc):
-            page_fields = [f for f in fields if f.page_number == page_num]
-            
-            for field in page_fields:
-                if not field.is_modified:
-                    continue
+        # Copia de trabajo en memoria
+        doc_copy = fitz.open()
+        doc_copy.insert_pdf(self._doc)
 
-                # Estrategia 1: Usar coordenadas exactas si existen
-                if field.rect:
-                    # fitz rect es [x0, y0, x1, y1]
-                    rect = fitz.Rect(field.rect)
-                    
-                    # 1. Redactar (borrar) área
-                    page.add_redact_annot(rect, fill=(1, 1, 1))
-                    page.apply_redactions()
-                    
-                    # 2. Insertar nuevo texto
-                    page.insert_textbox(
-                        rect, 
-                        field.current_value,
-                        fontsize=9, 
-                        fontname="helv",
-                        color=(0, 0, 0)
-                    )
-                else:
-                    # Estrategia 2 (Fallback): Buscar texto
-                    hits = page.search_for(field.original_value)
-                    if hits:
-                        for rect in hits:
-                            page.add_redact_annot(rect, fill=(1, 1, 1))
+        try:
+            for page_num, page in enumerate(doc_copy):
+                page_fields = [f for f in fields if f.page_number == page_num]
+                
+                for field in page_fields:
+                    if not field.is_modified:
+                        continue
+
+                    if field.rect:
+                        rect = fitz.Rect(field.rect)
+                        page.add_redact_annot(rect, fill=(1, 1, 1))
                         page.apply_redactions()
                         page.insert_textbox(
-                            hits[0], 
-                            field.current_value, 
-                            fontsize=10, 
+                            rect, 
+                            field.current_value,
+                            fontsize=9, 
                             fontname="helv",
                             color=(0, 0, 0)
                         )
+                    else:
+                        hits = page.search_for(field.original_value)
+                        if hits:
+                            for rect in hits:
+                                page.add_redact_annot(rect, fill=(1, 1, 1))
+                            page.apply_redactions()
+                            page.insert_textbox(
+                                hits[0], 
+                                field.current_value, 
+                                fontsize=10, 
+                                fontname="helv",
+                                color=(0, 0, 0)
+                            )
 
-        # Manejar guardado sobre el mismo archivo (Windows file lock)
-        is_overwrite = False
-        if self._path:
-            try:
-                is_overwrite = output_path.resolve() == self._path.resolve()
-            except OSError:
-                pass # Puede fallar si paths son extraños
+            # 1. Guardar siempre a un archivo NUEVO temporal primero
+            # Esto evita cualquier conflicto de bloqueo con el archivo de destino
+            doc_copy.save(str(temp_path), garbage=4, deflate=True)
+            
+        except Exception as e:
+            # Si falla el guardado, limpiar temporal
+            if temp_path.exists():
+                os.remove(str(temp_path))
+            raise e
+        finally:
+            doc_copy.close()
 
-        if is_overwrite:
-            # Guardar en temporal
-            temp_path = output_path.with_suffix(".tmp.pdf")
-            try:
-                self._doc.save(str(temp_path), garbage=4, deflate=True)
+        # 2. Reemplazar el archivo destino con el temporal
+        # Usamos os.replace (atómico en POSIX, renombra en Windows)
+        # Si el destino existe, intentamos eliminarlo primero si replace falla
+        try:
+            if output_path.exists():
+                # Forzar liberación de atributos de solo lectura si existen
+                try:
+                    os.chmod(str(output_path), 0o777)
+                except:
+                    pass
                 
-                # Cerrar documento para liberar lock
-                self._doc.close()
-                self._doc = None
-                
-                # Reemplazar archivo original
-                if output_path.exists():
+                # Intentar reemplazo directo
+                try:
+                    os.replace(str(temp_path), str(output_path))
+                except OSError:
+                    # Si falla (ej. bloqueado por antivirus o indexador), esperar y reintentar
+                    time.sleep(0.1)
                     os.remove(str(output_path))
+                    shutil.move(str(temp_path), str(output_path))
+            else:
                 shutil.move(str(temp_path), str(output_path))
                 
-                # Reabrir documento
-                self.load_pdf(output_path)
-            except Exception as e:
-                # Intentar limpiar
-                if temp_path.exists():
-                    os.remove(str(temp_path))
-                raise e
-        else:
-            # Guardar normal
-            self._doc.save(str(output_path), garbage=4, deflate=True)
+        except Exception as e:
+            # Si todo falla, no dejar basura
+            if temp_path.exists():
+                # No borrarlo, dejarlo para recuperación manual si es crítico
+                pass 
+            raise RuntimeError(f"Error al sobrescribir archivo final: {str(e)}. \nIntente guardar con otro nombre.")
 
     def close(self):
         if self._doc:

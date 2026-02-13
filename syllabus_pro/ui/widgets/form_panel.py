@@ -86,11 +86,29 @@ class FormPanel(QWidget):
         self.field_changed.emit(field.id, new_value)
 
     def apply_all_suggestions(self):
-        for field in self.fields_ref:
-            if field.suggested_value and field.current_value == field.original_value:
-                if field.id in self.inputs:
-                    widget = self.inputs[field.id]
-                    if isinstance(widget, QLineEdit):
-                        widget.setText(field.suggested_value)
-                    elif isinstance(widget, QTextEdit):
-                        widget.setPlainText(field.suggested_value)
+        from PySide6.QtWidgets import QMessageBox
+        
+        count = 0
+        try:
+            for field in self.fields_ref:
+                # Normalizar strings para comparación (strip whitespace)
+                curr = (field.current_value or "").strip()
+                orig = (field.original_value or "").strip()
+                sugg = (field.suggested_value or "").strip()
+                
+                if sugg and curr == orig:
+                    if field.id in self.inputs:
+                        widget = self.inputs[field.id]
+                        if isinstance(widget, QLineEdit):
+                            widget.setText(field.suggested_value)
+                        elif isinstance(widget, QTextEdit):
+                            widget.setPlainText(field.suggested_value)
+                        count += 1
+            
+            if count > 0:
+                QMessageBox.information(self, "Sugerencias", f"Se aplicaron {count} sugerencias correctamente.")
+            else:
+                QMessageBox.information(self, "Sugerencias", "No hay sugerencias nuevas para aplicar (o los campos ya fueron modificados).")
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error al aplicar sugerencias: {str(e)}")
