@@ -17,7 +17,15 @@ class PDFService:
             self._doc.close()
         
         self._path = path
-        self._doc = fitz.open(str(path))
+        # Abrir documento en memoria para evitar bloqueo del archivo en disco
+        # Esto permite que otros procesos (o nosotros mismos al guardar) sobrescriban el archivo original
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            self._doc = fitz.open(stream=data, filetype="pdf")
+        except Exception:
+            # Fallback a apertura normal si falla carga en memoria (ej. archivo muy grande)
+            self._doc = fitz.open(str(path))
         
         return self._analyze_document()
 
